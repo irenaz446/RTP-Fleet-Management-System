@@ -2,25 +2,35 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Vehicle Fleet Management System V2 — STM32 I2C Slave
+  * @brief          : Vehicle Fleet Management System V3 — STM32 I2C Slave
+  *                   Real-sensor edition (MPU-6050 + NEO-6M/8M GPS)
   *
-  * Responsibilities of this file (main.c):
-  *   - HAL peripheral initialisation
-  *   - TIM2 state machine (TRIP_START → ACTIVE → END → WAIT)
-  *   - Double-buffer pattern for safe I2C frame updates
-  *   - IRQ callbacks (I2C TX complete, TIM2 tick)
+  * Changes from V2:
+  *   + I2C1  master  → MPU-6050 IMU  (PB6 SCL, PB7 SDA)
+  *   + USART1 9600   → NEO-6M/8M GPS (PA10 RX, interrupt-driven)
+  *   + fleet_data_init() replaced by fleet_sensor_init(&hi2c1, &huart1)
+  *   + fleet_data_update() now reads real sensors instead of LCG sim
   *
-  * Sensor simulation and frame building → fleet_data.c / fleet_data.h
-  *
-  * Peripherals:
+  * Unchanged from V2:
   *   I2C2   slave, address 0x08, sends 84-byte frame when BBG reads
   *   TIM2   1 Hz interrupt  (Prescaler=15999, Period=999, HSI 16MHz)
-  *   USART3 115200 baud debug output
+  *   USART3 115200 baud debug output  (io_tools.c)
+  *   Double-buffer pattern, state machine, frame layout
   *
   * Wiring to BBG:
   *   PB10 (SCL) ──[4.7kΩ to 3.3V]── P9_19
   *   PB11 (SDA) ──[4.7kΩ to 3.3V]── P9_20
   *   GND        ──────────────────── P9_1
+  *
+  * Wiring to MPU-6050 (I2C1):
+  *   PB6 (SCL) ──[4.7kΩ to 3.3V]── MPU SCL
+  *   PB7 (SDA) ──[4.7kΩ to 3.3V]── MPU SDA
+  *   MPU VCC   ── 3.3V
+  *   MPU AD0   ── GND             (sets I2C addr = 0x68)
+  *
+  * Wiring to NEO-6M/8M (USART1):
+  *   PA10 (RX) ── GPS TX          (GPS operates at 3.3V logic)
+  *   GPS VCC   ── 3.3V
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -30,7 +40,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include "fleet_data.h"   /* telemetry_frame_t, fleet_data_init/update/get_frame */
+#include "fleet_data.h"   /* telemetry_frame_t, fleet_sensor_init, fleet_data_update, fleet_get_frame */
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN PTD */
@@ -44,14 +54,16 @@ typedef enum {
 
 /* USER CODE BEGIN PD */
 #define I2C_SLAVE_ADDR      0x08
-#define TRIP_DURATION_SEC   120   /* 2 minutes per trip      */
-#define WAIT_BETWEEN_SEC    10    /* 10 seconds between trips*/
+#define TRIP_DURATION_SEC   120   /* 2 minutes per trip       */
+#define WAIT_BETWEEN_SEC    10    /* 10 seconds between trips */
 /* USER CODE END PD */
 
 /* CubeMX handles */
-I2C_HandleTypeDef  hi2c2;
+I2C_HandleTypeDef  hi2c1;    /* V3: MPU-6050 master     */
+I2C_HandleTypeDef  hi2c2;    /* BBG slave (unchanged)   */
 TIM_HandleTypeDef  htim2;
-UART_HandleTypeDef huart3;
+UART_HandleTypeDef huart1;   /* V3: GPS 9600 baud       */
+UART_HandleTypeDef huart3;   /* Debug 115200 (unchanged)*/
 
 /* USER CODE BEGIN PV */
 
@@ -64,15 +76,13 @@ static telemetry_frame_t g_frame;
 /**
  * @brief Staging buffer — written by the main loop via fleet_get_frame().
  *        Promoted into g_frame in the TX callback when the bus is idle.
- *        Prevents race condition: memset inside fleet_get_frame() cannot
- *        zero g_frame while I2C DMA is simultaneously reading it.
  */
 static telemetry_frame_t g_next_frame;
 
 /** @brief Set by main loop when g_next_frame is ready to promote. */
 static volatile uint8_t  g_frame_ready = 0;
 
-/** @brief 1-second tick set by TIM2 IRQ — acts on in main loop only. */
+/** @brief 1-second tick set by TIM2 IRQ — acted on in main loop only. */
 static volatile uint8_t  g_tick        = 0;
 
 /** @brief TX complete flag — print outside IRQ to avoid printf in ISR. */
@@ -89,6 +99,9 @@ static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_I2C2_Init(void);
+/* V3 additions */
+static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
 
 /* USER CODE BEGIN 0 */
 
@@ -135,6 +148,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     g_tick = 1;
 }
 
+/* NOTE: HAL_UART_RxCpltCallback is defined in fleet_data.c
+ *       It pushes each GPS byte into the ring-buffer and re-arms IT. */
+
 /* USER CODE END 0 */
 
 int main(void)
@@ -145,11 +161,14 @@ int main(void)
     MX_TIM2_Init();
     MX_USART3_UART_Init();
     MX_I2C2_Init();
+    /* V3: initialise sensor peripherals BEFORE fleet_sensor_init */
+    MX_I2C1_Init();
+    MX_USART1_UART_Init();
 
     /* USER CODE BEGIN 2 */
 
     /* Verify frame size and field offsets at startup */
-    printf("=== Vehicle Fleet STM32 V2 starting ===\r\n");
+    printf("=== Vehicle Fleet STM32 V3 starting (real sensors) ===\r\n");
     printf("sizeof(telemetry_frame_t) = %d (expected %d)\r\n",
            (int)sizeof(telemetry_frame_t), FRAME_SIZE);
     printf("offsetof(msg_type)        = %d (expected 72)\r\n",
@@ -162,8 +181,8 @@ int main(void)
         Error_Handler();
     }
 
-    /* Initialise sensor simulation */
-    fleet_data_init(HAL_GetTick() / 1000UL);
+    /* V3: initialise real sensors (wakes MPU-6050, arms GPS UART IT) */
+    fleet_sensor_init(&hi2c1, &huart1);
 
     /* Prepare initial frame and arm I2C slave */
     fleet_get_frame(&g_frame, MSG_TRIP_DATA);
@@ -188,13 +207,15 @@ int main(void)
             static uint32_t stat_count = 0;
             if (++stat_count % 60 == 0) {
                 printf("[STATS] tx=%lu type=%c lat=%.4f lon=%.4f "
-                       "alt=%.1fm spd=%.1fkm/h\r\n",
+                       "alt=%.1fm spd=%.1fkm/h fix=%d sats=%d\r\n",
                        (unsigned long)g_total_tx,
                        g_frame.msg_type,
                        g_frame.latitude,
                        g_frame.longitude,
                        g_frame.altitude,
-                       g_frame.gps_speed_kmh);
+                       g_frame.gps_speed_kmh,
+                       g_frame.gps_fix,
+                       g_frame.satellites);
             }
         }
 
@@ -202,7 +223,7 @@ int main(void)
         if (!g_tick) continue;
         g_tick = 0;
 
-        fleet_data_update();   /* advance GPS position, altitude drift */
+        fleet_data_update();   /* V3: reads MPU-6050 + drains GPS NMEA buffer */
 
         switch (g_state) {
 
@@ -211,7 +232,8 @@ int main(void)
                 g_frame_ready = 1;
                 g_sec_count   = 0;
                 g_state       = STATE_TRIP_ACTIVE;
-                printf("[TRIP] Started\r\n");
+                printf("[TRIP] Started  (fix=%d sats=%d)\r\n",
+                       g_next_frame.gps_fix, g_next_frame.satellites);
                 break;
 
             case STATE_TRIP_ACTIVE:
@@ -267,6 +289,42 @@ void SystemClock_Config(void)
         Error_Handler();
 }
 
+/* ── V3: MPU-6050 I2C master ─────────────────────────────────────────── */
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance              = I2C1;
+    hi2c1.Init.Timing           = 0x00303D5B;   /* ~100 kHz at HSI 16 MHz */
+    hi2c1.Init.OwnAddress1      = 0;
+    hi2c1.Init.AddressingMode   = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode  = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2      = 0;
+    hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+    hi2c1.Init.GeneralCallMode  = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode    = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
+    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+        Error_Handler();
+    if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+        Error_Handler();
+}
+
+/* ── V3: GPS UART 9600 baud (RX only, interrupt-driven) ─────────────── */
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance                    = USART1;
+    huart1.Init.BaudRate               = 9600;
+    huart1.Init.WordLength             = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits               = UART_STOPBITS_1;
+    huart1.Init.Parity                 = UART_PARITY_NONE;
+    huart1.Init.Mode                   = UART_MODE_RX;
+    huart1.Init.HwFlowCtl              = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling           = UART_OVERSAMPLING_16;
+    huart1.Init.OneBitSampling         = UART_ONE_BIT_SAMPLE_DISABLE;
+    huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+    if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
+}
+
+/* ── BBG I2C slave (unchanged from V2) ──────────────────────────────── */
 static void MX_I2C2_Init(void)
 {
     hi2c2.Instance              = I2C2;
@@ -290,9 +348,9 @@ static void MX_TIM2_Init(void)
     TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
     TIM_MasterConfigTypeDef sMasterConfig      = {0};
     htim2.Instance               = TIM2;
-    htim2.Init.Prescaler         = 15999;
+    htim2.Init.Prescaler         = 15999;   /* HSI 16MHz → 1kHz     */
     htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim2.Init.Period            = 999;
+    htim2.Init.Period            = 999;     /* 1kHz / 1000 = 1Hz    */
     htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
     if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
@@ -322,7 +380,8 @@ static void MX_USART3_UART_Init(void)
 
 static void MX_GPIO_Init(void)
 {
-    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();   /* PA10 = USART1 RX */
+    __HAL_RCC_GPIOB_CLK_ENABLE();   /* PB6/7 = I2C1, PB10/11 = I2C2 */
     __HAL_RCC_GPIOD_CLK_ENABLE();
 }
 
